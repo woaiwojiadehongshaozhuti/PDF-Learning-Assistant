@@ -1,0 +1,307 @@
+"""
+    2 情景记忆 + 语义记忆模块
+    3
+    4 两种记忆都基于 ChromaDB 持久化存储，程序关了数据也不丢。
+    5
+    6 情景记忆 (EpisodicMemory)：记录"发生过什么事"
+    7   - 每次问答、加载文档、记笔记，都是一条"事件"
+    8   - 支持按语义搜索（"我之前关于Python聊过什么？"）
+    9   - 支持按时间看最近的事件
+   10
+   11 语义记忆 (SemanticMemory)：存储"我知道了什么知识"
+   12   - 用户说"记住 XXX"，就存进来
+   13   - 后续提问时，自动检索相关知识作为额外上下文
+   14   - 存的是抽象概念/偏好/规则，不是具体事件
+   15 """
+
+from datetime import datetime
+from typing import Optional
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+
+# 存储路径
+CHROMA_PATH = "./chroma_db"
+
+# 共用一个 embedding 模型（和 RAG 管道保持一致）
+_embeddings = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-small-zh-v1.5",
+    model_kwargs={"device": "cpu"},
+    encode_kwargs={"normalize_embeddings": True},
+)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  情景记忆(由于工作记忆用Inmemory存储，是一个短期的记忆)
+# ═══════════════════════════════════════════════════════════════
+
+class EpisodicMemory:
+    """
+    情景记忆 — 记录"发生过什么事件"。
+
+    存在 ChromaDB 的 episodic_memory collection 里。
+    每个事件是一条文本 + 元数据（时间、类型、重要性、会话ID）。
+    """
+
+    def __init__(self, session_id: str = "default"):
+        self.session_id = session_id
+        self.store = Chroma(
+            collection_name="episodic_memory",
+            embedding_function=_embeddings,
+            persist_directory=CHROMA_PATH,
+        )
+
+    def add_event(
+        self,
+        content: str,
+        event_type: str = "general",
+        importance: float = 0.5,
+    ) -> str:
+        """
+        添加一条事件。
+
+        参数:
+            content:    事件内容，如 "用户提问: Python 怎么学？"
+            event_type: 事件类型，如 qa_interaction / document_loaded / note_added
+            importance: 重要性 0.0~1.0
+
+        返回:
+            事件 ID
+        """
+        timestamp = datetime.now().isoformat()
+
+        ids = self.store.add_texts(
+            texts=[content],
+            metadatas=[{
+                "session_id": self.session_id,
+                "event_type": event_type,
+                "importance": importance,
+                "timestamp": timestamp,
+            }],
+        )
+        return ids[0]
+
+    def search(self, query: str, limit: int = 5, min_importance: float = 0.0):
+        """
+        按语义搜索过去的事件。
+
+        参数:
+            query:         搜索词，如 "Python 学习"
+            limit:         返回几条
+            min_importance: 只返回重要性 >= 这个值的
+        """
+        results = self.store.similarity_search(query, k=limit)
+
+        events = []
+        for doc in results:
+            meta = doc.metadata
+            if meta.get("importance", 0) >= min_importance:
+                events.append({
+                    "content": doc.page_content,
+                    "timestamp": meta.get("timestamp", "未知"),
+                    "event_type": meta.get("event_type", "general"),
+                    "importance": meta.get("importance", 0.5),
+                })
+        return events
+
+    def get_recent(self, n: int = 10):
+        """
+        获取最近 n 条事件（按添加顺序，不是语义搜索）。
+        注意：ChromaDB 不保证插入顺序，这是一个近似实现。
+        """
+        all_docs = self.store.get()
+        if not all_docs["ids"]:
+            return []
+
+        # 按 timestamp 排序
+        items = []
+        for i, doc_id in enumerate(all_docs["ids"]):
+            meta = all_docs["metadatas"][i]
+            items.append({
+                "content": all_docs["documents"][i],
+                "timestamp": meta.get("timestamp", ""),
+                "event_type": meta.get("event_type", "general"),
+            })
+
+        items.sort(key=lambda x: x["timestamp"], reverse=True)
+        return items[:n]
+
+    def get_summary(self) -> str:
+        """生成记忆摘要（事件类型统计 + 最近事件列表）"""
+        all_docs = self.store.get()
+        total = len(all_docs["ids"])
+
+        if total == 0:
+            return "📋 情景记忆为空，还没有记录任何事件。"
+
+        # 统计事件类型
+        type_counts = {}
+        for meta in all_docs.get("metadatas", []):
+            t = meta.get("event_type", "general")
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+        recent = self.get_recent(5)
+
+        summary = f"📋 情景记忆共 {total} 条事件\n"
+        summary += "\n事件类型分布:\n"
+        for t, c in type_counts.items():
+            label = {
+                "qa_interaction": "问答交互",
+                "document_loaded": "文档加载",
+                "note_added": "学习笔记",
+                "general": "通用事件",
+            }.get(t, t)
+            summary += f"  - {label}: {c} 条\n"
+
+        summary += "\n最近 5 条事件:\n"
+        for i, e in enumerate(recent, 1):
+            ts = e["timestamp"][:19] if e["timestamp"] else "未知"
+            content_preview = e["content"][:60]
+            summary += f"  {i}. [{ts}] {content_preview}...\n"
+
+        return summary
+
+
+# ═══════════════════════════════════════════════════════════════
+#  语义记忆
+# ═══════════════════════════════════════════════════════════════
+
+class SemanticMemory:
+    """
+    语义记忆 — 存储"我知道了什么"。
+
+    存在 ChromaDB 的 semantic_memory collection 里。
+    用于存储用户偏好、概念知识、自定义规则等。
+    """
+
+    def __init__(self):
+        self.store = Chroma(
+            collection_name="semantic_memory",
+            embedding_function=_embeddings,
+            persist_directory=CHROMA_PATH,
+        )
+
+    def add_knowledge(
+        self,
+        content: str,
+        importance: float = 0.7,
+        knowledge_type: str = "general",
+    ) -> str:
+        """
+        添加一条知识。
+
+        参数:
+            content:        知识内容，如 "用户张三喜欢简短的回答"
+            importance:     重要性 0.0~1.0
+            knowledge_type: 类型，如 user_preference / concept / rule / fact
+
+        返回:
+            知识 ID
+        """
+        timestamp = datetime.now().isoformat()
+
+        ids = self.store.add_texts(
+            texts=[content],
+            metadatas=[{
+                "importance": importance,
+                "knowledge_type": knowledge_type,
+                "timestamp": timestamp,
+            }],
+        )
+        return ids[0]
+
+    def search(self, query: str, limit: int = 3, min_importance: float = 0.0):
+        """
+        搜索相关语义知识。
+
+        后续提问时调用，把查到的知识作为"你已知的用户偏好/背景"注入 prompt。
+        """
+        results = self.store.similarity_search(query, k=limit)
+
+        items = []
+        for doc in results:
+            meta = doc.metadata
+            if meta.get("importance", 0) >= min_importance:
+                items.append({
+                    "content": doc.page_content,
+                    "knowledge_type": meta.get("knowledge_type", "general"),
+                    "importance": meta.get("importance", 0.5),
+                })
+        return items
+
+    def get_all(self):
+        """获取所有已存储的知识（数量少的时候用）"""
+        all_docs = self.store.get()
+        if not all_docs["ids"]:
+            return []
+
+        items = []
+        for i, doc_id in enumerate(all_docs["ids"]):
+            meta = all_docs["metadatas"][i]
+            items.append({
+                "content": all_docs["documents"][i],
+                "knowledge_type": meta.get("knowledge_type", "general"),
+                "importance": meta.get("importance", 0.5),
+            })
+        return items
+
+    def get_summary(self) -> str:
+        """显示已存储的知识摘要"""
+        all_items = self.get_all()
+
+        if not all_items:
+            return "🧠 语义记忆为空，还没有存储任何知识。"
+
+        summary = f"🧠 语义记忆共 {len(all_items)} 条知识:\n"
+        for i, item in enumerate(all_items, 1):
+            t = item["knowledge_type"]
+            label = {
+                "user_preference": "用户偏好",
+                "concept": "概念",
+                "rule": "规则",
+                "fact": "事实",
+                "general": "通用",
+            }.get(t, t)
+            summary += f"  {i}. [{label}] {item['content'][:80]}\n"
+
+        return summary
+
+
+# ═══════════════════════════════════════════════════════════════
+#  测试代码
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    # ── 测试情景记忆 ──
+    print("=" * 50)
+    print("测试情景记忆")
+    print("=" * 50)
+
+    ep = EpisodicMemory(session_id="test_session")
+
+    ep.add_event("加载了文档 Happy-LLM-0727.pdf", event_type="document_loaded", importance=0.9)
+    ep.add_event("用户提问: 什么是大语言模型？", event_type="qa_interaction", importance=0.7)
+    ep.add_event("用户提问: Transformer 架构是怎么样的？", event_type="qa_interaction", importance=0.8)
+    ep.add_event("用户添加了关于 Attention 机制的笔记", event_type="note_added", importance=0.6)
+
+    print("\n搜索 '大语言模型':")
+    for e in ep.search("大语言模型"):
+        print(f"  [{e['event_type']}] {e['content'][:60]}")
+
+    print("\n" + ep.get_summary())
+
+    # ── 测试语义记忆 ──
+    print("\n" + "=" * 50)
+    print("测试语义记忆")
+    print("=" * 50)
+
+    sm = SemanticMemory()
+
+    sm.add_knowledge("用户张三偏好简短、直击重点的回答", knowledge_type="user_preference", importance=0.9)
+    sm.add_knowledge("Transformer 的核心是自注意力机制", knowledge_type="concept", importance=0.8)
+    sm.add_knowledge("回答时优先使用中文，代码示例加注释", knowledge_type="rule", importance=0.7)
+
+    print("\n搜索 '用户偏好':")
+    for item in sm.search("用户偏好"):
+        print(f"  [{item['knowledge_type']}] {item['content'][:60]}")
+
+    print("\n" + sm.get_summary())

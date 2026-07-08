@@ -1,0 +1,89 @@
+"""
+测试脚本：对比 Agent 在"相关问题"和"无关问题"上的行为差异
+直接用已有 ChromaDB，不重新索引 PDF。
+"""
+import sys, os, io
+# 强制 UTF-8 输出，避免 Windows GBK 编码问题
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from langchain.tools import tool
+from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import InMemorySaver
+from RAG import search as rag_search
+
+# ── 工具：搜索文档（和 PDFLearningAssitant 里一样） ──
+@tool
+def search_document(query: str) -> str:
+    """在已加载的 PDF 文档中搜索相关内容。当用户询问文档中的知识时，用这个工具检索。"""
+    docs = rag_search(query, strategy="mqe", k=4)
+    if not docs:
+        return "未在文档中找到相关内容。"
+    return "\n\n---\n".join(
+        f"[来源页 {doc.metadata.get('page', '?')}]\n{doc.page_content}"
+        for doc in docs
+    )
+
+# ── 创建 Agent（使用优化后的 system_prompt） ──
+llm = ChatOpenAI(
+    model="deepseek-chat",
+    temperature=0,
+    api_key="sk-f41668d2e42743fa9dce5e61d76a3822",
+    base_url="https://api.deepseek.com",
+)
+
+system_prompt = """你是一个智能文档学习助手，帮助用户理解和学习 PDF 文档的内容。
+
+## 工具使用策略
+- search_document：当用户询问**文档中的具体内容**时使用。
+- 注意：通用知识问题（如编程基础、数学概念、常识等）**不需要**查文档，用你的知识直接回答。
+- 闲聊和问候直接回应，不需要调工具。
+
+## 回答风格
+- 基于文档时标注来源页码
+- 用中文交流
+"""
+
+agent = create_agent(
+    model=llm,
+    system_prompt=system_prompt,
+    tools=[search_document],
+    checkpointer=InMemorySaver(),
+)
+
+# ═══════════════════════════════════════════════════════════
+#  测试
+# ═══════════════════════════════════════════════════════════
+
+test_questions = [
+    # 问题1：PDF 相关（预期：调 search_document）
+    ("user-001", "文档中关于大语言模型的安全问题讨论了哪些内容？"),
+
+    # 问题2：完全无关（预期：不调 search_document，直接回答或拒绝）
+    ("user-002", "帮我写一份房屋租赁合同模板"),
+]
+
+for thread_id, question in test_questions:
+    print("=" * 60)
+    print(f"[问题] {question}")
+    print("-" * 60)
+
+    config = {"configurable": {"thread_id": thread_id}}
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": question}]},
+        config=config,
+    )
+
+    # ── 打印中间步骤（看 Agent 调了哪个工具） ──
+    for i, msg in enumerate(result["messages"]):
+        role = getattr(msg, "type", "unknown")
+        if role == "tool":
+            print(f"[调用了工具] {msg.name}")
+            print(f"   工具返回（前200字）: {str(msg.content)[:200]}...")
+        elif role == "ai":
+            print(f"[Agent 回答] {str(msg.content)[:500]}")
+        elif role == "human":
+            pass  # 不打印用户输入
+
+    print()

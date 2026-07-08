@@ -1,0 +1,532 @@
+"""
+    RAG 管道（升级版）
+    功能：加载 PDF → 分块 → 向量化 → 三种检索策略 → 生成回答
+
+    检索策略:
+      - basic:  直接用问题向量搜（原简易版）
+      - mqe:    多查询扩展，用 LLM 改写出多个查询并行搜
+      - hyde:   假设文档嵌入，先让 LLM 脑补答案，用答案去搜
+"""
+
+import os
+import jieba
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_core.documents import Document
+from sentence_transformers import CrossEncoder
+from rank_bm25 import BM25Okapi
+from dotenv import load_dotenv
+load_dotenv()
+import os
+# ── 路径 & 模型配置 ──────────────────────────────────────
+CHROMA_PATH = "./chroma_db"
+
+_embeddings = HuggingFaceEmbeddings(
+    # BGE-small-zh: 轻量中文 Embedding，512维，仅 95MB
+    # 中文效果远超 all-MiniLM-L6-v2，内存友好
+    model_name="BAAI/bge-small-zh-v1.5",
+    model_kwargs={"device": "cpu"},
+    encode_kwargs={"normalize_embeddings": True},
+)
+
+_llm = ChatOpenAI(
+    model="deepseek-chat",
+    temperature=0,
+    api_key=os.getenv("API_KEY"),
+    base_url="https://api.deepseek.com",
+)
+
+# Re-Rank 模型：延迟加载，避免 import 时就占 2GB 内存
+# 第一次调用 _rerank() 时才会加载模型
+_reranker = None
+
+
+def _get_reranker():
+    """延迟初始化 Cross-Encoder（用到才加载，省内存）"""
+    global _reranker
+    if _reranker is None:
+        _reranker = CrossEncoder(
+            # 轻量英文 Cross-Encoder，200MB，内存友好
+            # 中文效果不如 bge-reranker-v2-m3，但不会 OOM
+            "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            max_length=512,
+        )
+    return _reranker
+
+
+# ── BM25 索引（延迟加载，和 Reranker 一样用到才加载） ──
+_bm25 = None       # BM25Okapi 实例
+_bm25_docs = None  # 与 BM25 索引顺序一致的 Document 列表
+
+
+def _get_bm25():
+    """
+    延迟初始化 BM25 索引。
+    从 ChromaDB 中读取所有 chunk，用 jieba 分词后构建 BM25 索引。
+    """
+    global _bm25, _bm25_docs
+    if _bm25 is not None:
+        return _bm25, _bm25_docs
+
+    vector_store = _get_vector_store()
+    all_data = vector_store.get()
+
+    if not all_data or not all_data.get("documents"):
+        _bm25_docs = []
+        _bm25 = BM25Okapi([])
+        return _bm25, _bm25_docs
+
+    _bm25_docs = []
+    corpus_tokens = []
+
+    for i, content in enumerate(all_data["documents"]):
+        # jieba 分词：中文需要分词后 BM25 才能按词匹配
+        # 英文词自然被保留为独立 token
+        tokens = list(jieba.cut(content))
+        corpus_tokens.append(tokens)
+
+        # 重建 Document 对象
+        meta = all_data["metadatas"][i] if all_data.get("metadatas") else {}
+        _bm25_docs.append(Document(page_content=content, metadata=meta))
+
+    _bm25 = BM25Okapi(corpus_tokens)
+    print(f"[BM25] 已构建索引，共 {len(_bm25_docs)} 篇文档")
+    return _bm25, _bm25_docs
+
+
+def _search_bm25(query: str, k: int = 12) -> list:
+    """
+    BM25 稀疏检索：基于 TF-IDF 关键词匹配。
+    返回 List[Document]，按 BM25 分数降序排列。
+    """
+    bm25, docs = _get_bm25()
+    if not docs:
+        return []
+
+    tokens = list(jieba.cut(query))
+    scores = bm25.get_scores(tokens)
+
+    # 按分数降序取 top_k（只取分数 > 0 的，滤掉完全不匹配的）
+    indexed_scores = [(i, s) for i, s in enumerate(scores) if s > 0]
+    indexed_scores.sort(key=lambda x: x[1], reverse=True)
+    top_indices = [i for i, _ in indexed_scores[:k]]
+
+    return [docs[i] for i in top_indices]
+
+
+def _rrf_fusion(dense_docs: list, bm25_docs: list, k: int = 60) -> list:
+    """
+    RRF (Reciprocal Rank Fusion) — 融合 Dense 和 Sparse 的两路排序结果。
+
+    公式: RRF_score(d) = Σ 1 / (rank + k)
+
+    为什么用 RRF 而不是简单加权？
+      - Dense 的分数是余弦距离 (0~2)，BM25 是词频分数 (0~∞)，量纲不同
+      - RRF 只关心排名，不关心原始分数 → 自然归一化
+      - k 参数让排名靠后的文档贡献衰减，避免噪声
+    """
+    scores = {}
+    doc_lookup = {}  # content → Document 对象
+
+    # Dense 路：排名越靠前 → RRF 分数越高
+    for rank, doc in enumerate(dense_docs):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0) + 1.0 / (rank + k)
+        doc_lookup[key] = doc
+
+    # BM25 路：同样按排名贡献
+    for rank, doc in enumerate(bm25_docs):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0) + 1.0 / (rank + k)
+        doc_lookup[key] = doc
+
+    # 按 RRF 总分降序排列，去重
+    seen = set()
+    merged = []
+    for content, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True):
+        if content not in seen:
+            seen.add(content)
+            merged.append(doc_lookup[content])
+
+    return merged
+
+
+# ══════════════════════════════════════════════════════════════
+#  第 1 部分：文档加载 →分块 →向量化（和简易版一样）
+# ══════════════════════════════════════════════════════════════
+
+def load_document(file_path: str, batch_size: int = 8):
+    """加载 PDF，语义分块，分批向量化，存入 ChromaDB，返回 vector_store"""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"文件不存在: {file_path}")
+
+    loader = PyPDFLoader(file_path)
+    pages = loader.load()
+    print(f"[加载] {len(pages)} 页")
+
+    # ── 语义分块：用 Embedding 检测语义断点，而非固定字数切割 ──
+    # 原理：相邻句子分别做 embedding，如果相似度断崖下跌，
+    #       说明话题切换了 → 在这里断开
+    # 好处：每个 chunk 是一个完整的语义单元，不会把一句话劈成两半
+    #
+    # SemanticChunker 会对每个句子计算 embedding，大文档一次性跑容易 OOM/崩溃。
+    # 策略：按 30 页一批分批处理，既享受语义分块的好处，又不会爆内存。
+    SEMANTIC_BATCH = 30  # 每批最多 30 页
+    try:
+        text_splitter = SemanticChunker(
+            embeddings=_embeddings,
+            breakpoint_threshold_type="percentile",
+            breakpoint_threshold_amount=80,
+        )
+        chunks = []
+        for batch_start in range(0, len(pages), SEMANTIC_BATCH):
+            batch_pages = pages[batch_start : batch_start + SEMANTIC_BATCH]
+            batch_chunks = text_splitter.split_documents(batch_pages)
+            chunks.extend(batch_chunks)
+            print(f"[语义分块] {min(batch_start + SEMANTIC_BATCH, len(pages))}/{len(pages)} 页")
+        print(f"[分块] {len(chunks)} 个语义块 (SemanticChunker, 每批≤{SEMANTIC_BATCH}页)")
+    except Exception as e:
+        print(f"[警告] SemanticChunker 失败 ({e})，降级为 RecursiveCharacterTextSplitter")
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200,
+            separators=["\n\n", "\n", "。", "！", "？", "；", " ", ""],
+        )
+        chunks = text_splitter.split_documents(pages)
+        print(f"[分块] {len(chunks)} 个文本块 (RecursiveCharacterTextSplitter)")
+
+    # 统计分块大小分布
+    lengths = [len(c.page_content) for c in chunks]
+    print(f"[分块] 最短: {min(lengths)} 字 | 最长: {max(lengths)} 字 | 平均: {sum(lengths)//len(lengths):.0f} 字")
+
+    # 分批写入 ChromaDB（避免一次性编码所有 chunk 导致内存溢出）
+    vector_store = None
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i : i + batch_size]
+        if vector_store is None:
+            vector_store = Chroma.from_documents(
+                documents=batch,
+                embedding=_embeddings,
+                persist_directory=CHROMA_PATH,
+            )
+        else:
+            vector_store.add_documents(batch)
+        print(f"[向量化] {min(i + batch_size, len(chunks))}/{len(chunks)} 块")
+
+    print(f"[存储] 已保存到 {CHROMA_PATH}")
+    return vector_store
+
+
+def _get_vector_store():
+    """获取已有的 vector_store（不重新加载文档）"""
+    return Chroma(
+        persist_directory=CHROMA_PATH,
+        embedding_function=_embeddings,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  第 2 部分：三种检索策略
+# ══════════════════════════════════════════════════════════════
+
+def _deduplicate(results: list, top_k: int) -> list:
+    """
+    按 score 去重合并多个检索结果，取 top_k。
+    results: List[Tuple[Document, float]] — (doc, score)，score 是距离，越小越相关
+    """
+    # 先按 score 升序排列（距离越小越相关）
+    sorted_results = sorted(results, key=lambda x: x[1])
+
+    seen = set()
+    merged = []
+    for doc, _score in sorted_results:
+        content = doc.page_content
+        if content not in seen:
+            seen.add(content)
+            merged.append(doc)
+    return merged[:top_k]
+
+
+def _rerank(query: str, docs: list, top_k: int) -> list:
+    """
+    Cross-Encoder 精排：对粗检索召回的候选文档逐条打分，取 top_k。
+
+    流程：
+      粗检索(k*3) → 去重 → **Cross-Encoder 打分** → 取 top_k
+                           ↑ 这一步
+
+    为什么需要？
+      向量相似度 ≠ 语义匹配度。
+      Cross-Encoder 把 query 和 doc 拼在一起做全交互注意力，
+      比双塔模型（embedding）更能理解「这句话真的回答了问题吗」。
+    """
+    if len(docs) <= top_k:
+        return docs  # 候选不够，直接返回
+
+    # 构造 (query, doc) 对
+    pairs = [[query, doc.page_content] for doc in docs]
+    scores = _get_reranker().predict(pairs)
+
+    # 按分数降序排列
+    ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+    return [doc for doc, _ in ranked[:top_k]]
+
+
+# ── 策略 1：基础向量检索 ─────────────────────────────────
+
+def search_basic(query: str, k: int = 4, recall_multiplier: int = 3) -> list:
+    """
+    直接用问题向量去搜，不做任何扩展。
+    recall_multiplier: 粗召回倍数，拿 k*3 候选供后续 Re-Rank 精排。
+    """
+    vector_store = _get_vector_store()
+    results_with_score = vector_store.similarity_search_with_score(
+        query, k=k * recall_multiplier
+    )
+    return _deduplicate(results_with_score, k * recall_multiplier)
+
+
+# ── 策略 2：MQE 多查询扩展 ───────────────────────────────
+
+def _generate_expanded_queries(query: str, n: int = 3) -> list[str]:
+    """
+    让 LLM 把原始问题改写成 n 个不同角度的查询。
+
+    例如 "什么是Transformer？" →
+      - "Transformer 架构的定义"
+      - "请解释 Transformer 模型的原理"
+      - "Transformer 由哪些组件构成"
+    """
+    prompt = f"""你是一个搜索查询改写专家。你的任务是把用户的原始问题改写成多个不同角度的查询，用于提高文档检索的召回率。
+
+## 改写策略（每个查询用不同策略）
+1. **同义替换**：用不同的词说同一件事（如 "自注意力" → "self-attention 机制"）
+2. **细化拆解**：把宽泛问题拆成更具体的问题（如 "Transformer 是什么" → "Transformer 的编码器结构是怎样的"）
+3. **泛化抽象**：反过来，把具体问题上升到概念层面（如 "BERT 怎么微调" → "预训练语言模型的下游任务适配方法"）
+4. **换角度**：从不同视角问（如"XX 的作用" → "为什么要用 XX" / "没有 XX 会怎样"）
+5. **中英混合**：如果原查询是中文但涉及英文术语，生成一个使用英文术语的版本
+
+## 示例
+
+**输入**：
+原始查询：Transformer 的自注意力机制是怎么工作的？
+
+**输出**（共 3 个）：
+Transformer 中 self-attention 的计算流程是什么
+自注意力机制中 Q、K、V 三个矩阵的作用和计算方式
+为什么 Transformer 要使用自注意力而不是 RNN？自注意力的优势是什么
+
+**输入**：
+原始查询：{query}
+
+现在直接输出 {n} 个查询，每行一个，不要加编号、前缀、"输出："等任何额外内容，不要加解释。第一个必须是原始查询本身。"""
+
+    # 注意：原始查询已在 queries 列表初始化时加入，这里让 LLM 也输出原始查询
+    # 是为了保持一致性和利用 LLM 的改写能力
+
+    response = _llm.invoke(prompt)
+    content = response.content.strip()
+
+    # 清洗：去掉可能的前导符号，过滤空行
+    queries = [query]  # 始终保留原查询
+    for line in content.split("\n"):
+        line = line.lstrip("-•·1234567890.)：:").strip()
+        if line and line not in queries:
+            queries.append(line)
+
+    return queries
+
+
+def search_mqe(query: str, k: int = 4, expansions: int = 3, recall_multiplier: int = 3) -> list:
+    """
+    MQE: 生成多个改写查询 →并行搜索 →合并去重 →返回候选。
+
+    每个扩展查询搜 k * recall_multiplier 条，
+    合并去重后保留足够候选给后续 Re-Rank。
+    """
+    queries = _generate_expanded_queries(query, n=expansions)
+    print(f"[MQE] 原始查询 + {len(queries)-1} 个扩展查询")
+
+    vector_store = _get_vector_store()
+
+    # 每个查询搜 k * recall_multiplier 条，保证合并后有充足候选
+    all_results = []
+    for q in queries:
+        results = vector_store.similarity_search_with_score(
+            q, k=k * recall_multiplier
+        )
+        all_results.extend(results)
+
+    # 去重，保留 k * recall_multiplier 条给 Re-Rank
+    return _deduplicate(all_results, k * recall_multiplier)
+
+
+# ── 策略 3：HyDE 假设文档嵌入 ─────────────────────────────
+
+def _generate_hypothetical_answer(query: str) -> str:
+    """
+    让 LLM 对问题生成一段"假设答案"，用于代替原问题做向量检索。
+
+    核心直觉：问题和答案在语义空间的分布不同——
+    问题是疑问句，答案是陈述句。用假设答案去搜，向量更接近真实文档。
+    """
+    prompt = f"""你是一个学术文档写作助手。你的任务是根据问题，**模拟一段可能出现在教科书或学术论文中的答案段落**。这段假答案将用于向量检索——它的 embedding 会比疑问句更接近真实文档的 embedding。
+
+## 写作要求
+1. **学术陈述风格**：用客观、平实的陈述句，像教科书/论文的正文。不用"你"、"我们"等口语化表达。
+2. **包含关键术语**：使用该领域的中文和英文术语（如 "自注意力机制 (self-attention)"），因为真实文档中大概率会出现这些术语。
+3. **中等长度**：150-300 字，不要过短（信息量不足）也不要过长（引入噪声）。
+4. **结构完整**：先给核心定义/结论，再展开关键细节。
+5. **不需要完全准确**：这是检索用的"诱饵"，不是最终答案。有些细节可以模糊或近似，目的是触碰真实文档的语义空间。
+
+## 示例
+
+**输入问题**：BERT 模型的预训练任务有哪些？
+
+**假设答案**：
+BERT（Bidirectional Encoder Representations from Transformers）的预训练包含两个核心任务。第一个是掩码语言模型（Masked Language Model, MLM），随机遮挡输入序列中约15%的token，让模型根据上下文双向信息预测被遮挡的词。第二个是下一句预测（Next Sentence Prediction, NSP），判断两个句子在原始文本中是否连续，帮助模型学习句子间的关系。这两个任务共同训练使得BERT能够学习深层的双向语言表征，在下游任务如文本分类、命名实体识别、问答系统中都取得了显著的效果提升。
+
+**输入问题**：{query}
+
+**假设答案**（直接写段落，不要加任何前缀或说明）："""
+
+    response = _llm.invoke(prompt)
+    return response.content.strip()
+
+
+def search_hyde(query: str, k: int = 4, recall_multiplier: int = 3) -> list:
+    """
+    HyDE: 先生成假设答案 →用假设答案的向量去搜 →返回候选。
+
+    recall_multiplier: 粗召回倍数，拿 k*3 候选供后续 Re-Rank 精排。
+    """
+    hypothetical = _generate_hypothetical_answer(query)
+    print(f"[HyDE] 假设答案（前 120 字）: {hypothetical[:120]}...")
+
+    vector_store = _get_vector_store()
+    results_with_score = vector_store.similarity_search_with_score(
+        hypothetical, k=k * recall_multiplier
+    )
+    return _deduplicate(results_with_score, k * recall_multiplier)
+
+
+# ── 统一检索入口 ──────────────────────────────────────────
+
+def search(query: str, strategy: str = "basic", k: int = 4, rerank: bool = True, hybrid: bool = True) -> list:
+    """
+    统一检索入口，根据 strategy 选择检索策略。
+
+    流程（以 k=4 为例）:
+      Dense 召回 12 条 ↘
+                         → RRF 融合 → 去重 → Cross-Encoder 精排 → 取 top-4
+      BM25  召回 12 条 ↗
+
+    参数:
+        query:    用户问题
+        strategy: "basic" / "mqe" / "hyde"
+        k:        最终返回结果数量
+        rerank:   是否启用 Cross-Encoder 重排序（默认开启）
+        hybrid:   是否启用混合检索 Dense+BM25（默认开启）
+
+    返回:
+        相关文档片段列表 (list of Document)
+    """
+    # ── 第一步：Dense 粗检索 ──
+    if strategy == "mqe":
+        dense_candidates = search_mqe(query, k=k)
+    elif strategy == "hyde":
+        dense_candidates = search_hyde(query, k=k)
+    else:
+        dense_candidates = search_basic(query, k=k)
+
+    # ── 第二步：BM25 稀疏检索（如果开启混合检索） ──
+    if hybrid:
+        bm25_candidates = _search_bm25(query, k=k * 3)
+        print(f"[混合检索] Dense {len(dense_candidates)} 条 + BM25 {len(bm25_candidates)} 条")
+
+        # RRF 融合两路结果
+        candidates = _rrf_fusion(dense_candidates, bm25_candidates)
+    else:
+        candidates = dense_candidates
+
+    print(f"[检索] 粗召回 {len(candidates)} 条候选（融合后）")
+
+    # ── 第三步：Cross-Encoder 精排 → 取 top_k ──
+    if rerank and len(candidates) > k:
+        candidates = _rerank(query, candidates, k)
+        print(f"[Re-Rank] 精排后保留 {len(candidates)} 条")
+
+    return candidates[:k]
+
+
+# ══════════════════════════════════════════════════════════════
+#  第 3 部分：生成回答
+# ══════════════════════════════════════════════════════════════
+
+def generate_answer(query: str, strategy: str = "basic", k: int = 4) -> str:
+    """
+    检索 + 生成：从文档中搜到相关内容 →拼成上下文 →让 LLM 回答。
+
+    这是用户最终调用的函数，一步得到自然语言答案。
+    """
+    # 1. 检索（粗召回 + Re-Rank 精排）
+    docs = search(query, strategy=strategy, k=k)
+
+    if not docs:
+        return "未在文档中找到相关内容。"
+
+    # 2. 拼接上下文（带页码引用）
+    context_parts = []
+    for i, doc in enumerate(docs, 1):
+        page = doc.metadata.get("page", "?")
+        context_parts.append(f"[片段{i} | 第{page}页]\n{doc.page_content}")
+    context = "\n\n---\n\n".join(context_parts)
+
+    # 3. 调用 LLM 生成答案
+    prompt = f"""你是一个严谨的文档问答助手。你的知识**仅来源于**下面提供的文档片段，不要使用你自己的外部知识。
+
+## 行为准则（必须遵守）
+1. **以文档为准**：回答必须基于文档片段中的信息。如果某个说法在文档中找不到原文支撑，就视为"未提及"。
+2. **诚实优先**：宁可说"文档中未提及该内容"或"文档只提到了X，未涉及Y"，也不要推测、补充或编造。
+3. **引用格式**：每陈述一个来自文档的事实，在后面标注出处，如 [片段1]、[片段3]。同一个事实如果跨多个片段，写 [片段1, 片段3]。
+4. **区分文档内/外**：如果用户问题涉及的知识在文档中完全没有，直接说"文档中未找到相关内容"。如果文档有部分覆盖但不完整，说清楚"文档提到了X方面，但没有涉及Y方面"。
+5. **回答结构**（视问题类型灵活调整）：
+   - 事实型问题（"XX是什么"）：直接给定义/解释 → 出处
+   - 总结型问题（"这篇文章讲了什么"）：先给总体概括 → 再分点展开
+   - 比较型问题（"A和B的区别"）：先对比总结 → 再分别说明 → 出处
+6. **不确定时标注置信度**：如果文档对某个问题的描述不够明确，可以说"文档中似乎暗示…（[片段X]，但表述不够明确）"
+
+## 回答格式模板
+
+**好的回答示例 1**（事实型）：
+> 问题：什么是自注意力机制？
+>
+> 自注意力机制（Self-Attention）是 Transformer 架构的核心组件，它允许模型在处理序列中的每个元素时，关注同一序列中的所有其他元素，从而捕捉长距离依赖关系。[片段1]
+>
+> 具体来说，自注意力通过三个矩阵——查询（Q）、键（K）、值（V）来计算注意力权重，公式为 Attention(Q,K,V)=softmax(QK^T/√d_k)V。[片段2]
+
+**好的回答示例 2**（文档未覆盖）：
+> 问题：GPT-4 的训练数据规模是多少？
+>
+> 文档中未找到关于 GPT-4 训练数据规模的内容。文档主要讨论了 Transformer 基础架构和 BERT 等早期预训练模型，未涉及 GPT-4 的具体参数或训练细节。
+
+**糟糕的回答**（禁止出现）：
+> 问题：作者认为深度学习的未来趋势是什么？
+>
+> ❌ "作者认为深度学习未来会向更大模型发展…" — 如果文档没提"大模型"，这就是**编造**
+>
+> ✅ 应该这样："文档第15-18页讨论了深度学习当前面临的挑战（[片段2]），包括计算成本、数据需求等问题，但文档中**未明确提及**作者对未来趋势的看法。"
+
+## 相关文档片段
+{context}
+
+## 用户问题
+{query}
+
+## 回答"""
+
+    response = _llm.invoke(prompt)
+    return response.content.strip()

@@ -29,7 +29,7 @@ def search_document(query: str) -> str:
 llm = ChatOpenAI(
     model="deepseek-chat",
     temperature=0,
-    api_key="sk-f41668d2e42743fa9dce5e61d76a3822",
+    api_key=api_key,
     base_url="https://api.deepseek.com",
 )
 
